@@ -41,6 +41,42 @@ export interface OrphanMapping {
   reason: string
 }
 
+export type ReviewStatus = 'pending' | 'confirmed' | 'rejected'
+export type FeatureChangeKind = 'added' | 'removed' | 'modified'
+
+export interface IdDelta {
+  added: string[]
+  removed: string[]
+}
+
+export interface FeatureDiff {
+  kind: FeatureChangeKind
+  featureId: string
+  claimNumber: number | null
+  label: string
+  beforeText: string
+  afterText: string
+  parentDelta: { from: string | null; to: string | null }
+  referenceDelta: IdDelta
+  supportDelta: IdDelta
+}
+
+export interface FeatureReviewItem {
+  featureId: string
+  status: ReviewStatus
+  opinion: string
+  updatedAt: string
+  authorRole: Role
+  authorName: string
+}
+
+export interface ReviewBatch {
+  id: string
+  baseVersionId: string
+  targetVersionId: string
+  items: FeatureReviewItem[]
+}
+
 export interface ClaimVersion {
   id: string
   name: string
@@ -63,6 +99,7 @@ export interface WorkbenchState {
   annotations: Annotation[]
   orphanMappings: OrphanMapping[]
   versions: ClaimVersion[]
+  reviewBatches: ReviewBatch[]
   role: Role
   selectedClaimId: string
   selectedFeatureId: string | null

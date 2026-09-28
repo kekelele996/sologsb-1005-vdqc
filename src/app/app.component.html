@@ -176,6 +176,104 @@
               </div>
             </article>
           </div>
+
+          <div class="review-batch" *ngIf="state.versions.length >= 2 && compareA && compareB && compareA !== compareB">
+            <div class="batch-heading">
+              <div>
+                <span class="eyebrow">特征级审查批次</span>
+                <h2>按技术特征归并的新增 / 移除 / 调整</h2>
+                <p class="hint">除正文外，逐项列出父级、引用与说明书依据差异，供审查员核对支持依据与特征关系是否随版本同步。</p>
+              </div>
+              <div class="batch-counts">
+                <span class="count-pill total">共 {{ reviewCounts.total }}</span>
+                <span class="count-pill pending">待确认 {{ reviewCounts.pending }}</span>
+                <span class="count-pill confirmed">已确认 {{ reviewCounts.confirmed }}</span>
+                <span class="count-pill rejected">已驳回 {{ reviewCounts.rejected }}</span>
+              </div>
+            </div>
+
+            <div class="batch-toolbar">
+              <label>差异类型
+                <p-select [options]="reviewKindOptions" optionLabel="label" optionValue="value" [(ngModel)]="reviewKindFilter" [style]="{ minWidth: '150px' }" />
+              </label>
+              <label>审查状态
+                <p-select [options]="reviewStatusOptions" optionLabel="label" optionValue="value" [(ngModel)]="reviewStatusFilter" [style]="{ minWidth: '150px' }" />
+              </label>
+              <p-button label="按当前筛选批量指派" icon="pi pi-user-plus" [disabled]="state.role === 'viewer' || !filteredFeatureDiffs.length" (onClick)="assignReviewBatch()" pTooltip="代理人将筛选结果批量指派给本人；已定稿（已确认/已驳回）项保持原样" />
+              <span class="assign-note" *ngIf="state.role === 'examiner'">审查员可直接逐项标记；批量指派限代理人操作。</span>
+            </div>
+            <p class="assign-message" *ngIf="reviewAssignMessage">{{ reviewAssignMessage }}</p>
+
+            <div class="feature-diff-list">
+              <article class="feature-diff" *ngFor="let diff of filteredFeatureDiffs" [class.status-confirmed]="reviewItemOf(diff.featureId).status === 'confirmed'" [class.status-rejected]="reviewItemOf(diff.featureId).status === 'rejected'">
+                <header class="feature-diff-head">
+                  <div class="feature-diff-title">
+                    <span class="kind-badge" [class.added]="diff.kind === 'added'" [class.removed]="diff.kind === 'removed'" [class.modified]="diff.kind === 'modified'">{{ reviewKindLabel(diff.kind) }}</span>
+                    <strong>{{ diff.label }}</strong>
+                    <small *ngIf="diff.claimNumber !== null">权利要求 {{ diff.claimNumber }}</small>
+                  </div>
+                  <div class="status-toggle" role="group" aria-label="审查状态">
+                    <button type="button" [class.active]="reviewItemOf(diff.featureId).status === 'pending'" (click)="setReviewStatus(diff.featureId, 'pending')" [disabled]="state.role === 'viewer'">待确认</button>
+                    <button type="button" [class.active]="reviewItemOf(diff.featureId).status === 'confirmed'" (click)="setReviewStatus(diff.featureId, 'confirmed')" [disabled]="state.role === 'viewer'"><i class="pi pi-check"></i>已确认</button>
+                    <button type="button" [class.active]="reviewItemOf(diff.featureId).status === 'rejected'" (click)="setReviewStatus(diff.featureId, 'rejected')" [disabled]="state.role === 'viewer'"><i class="pi pi-times"></i>已驳回</button>
+                  </div>
+                </header>
+
+                <div class="diff-cols" *ngIf="diff.kind === 'modified'">
+                  <div><small>基准正文</small><p>{{ diff.beforeText || '（空）' }}</p></div>
+                  <div><small>目标正文</small><p>{{ diff.afterText || '（空）' }}</p></div>
+                </div>
+                <div class="diff-cols single" *ngIf="diff.kind === 'added'">
+                  <div><small>新增特征正文</small><p>{{ diff.afterText || '（空）' }}</p></div>
+                </div>
+                <div class="diff-cols single" *ngIf="diff.kind === 'removed'">
+                  <div><small>移除特征正文</small><p>{{ diff.beforeText || '（空）' }}</p></div>
+                </div>
+
+                <ul class="relation-diff">
+                  <li *ngIf="diff.parentDelta.from !== diff.parentDelta.to">
+                    <span class="rel-label">父级</span>
+                    <span class="rel-from">{{ featureNameInVersion(compareA, diff.parentDelta.from) }}</span>
+                    <i class="pi pi-arrow-right"></i>
+                    <span class="rel-to">{{ featureNameInVersion(compareB, diff.parentDelta.to) }}</span>
+                  </li>
+                  <li *ngIf="diff.referenceDelta.added.length">
+                    <span class="rel-label">引用 +</span>
+                    <span class="rel-to" *ngFor="let id of diff.referenceDelta.added">{{ featureNameInVersion(compareB, id) }}</span>
+                  </li>
+                  <li *ngIf="diff.referenceDelta.removed.length">
+                    <span class="rel-label">引用 −</span>
+                    <span class="rel-from" *ngFor="let id of diff.referenceDelta.removed">{{ featureNameInVersion(compareA, id) }}</span>
+                  </li>
+                  <li *ngIf="diff.supportDelta.added.length">
+                    <span class="rel-label">依据 +</span>
+                    <span class="rel-to" *ngFor="let id of diff.supportDelta.added">{{ supportSection(id) }}</span>
+                  </li>
+                  <li *ngIf="diff.supportDelta.removed.length">
+                    <span class="rel-label">依据 −</span>
+                    <span class="rel-from" *ngFor="let id of diff.supportDelta.removed">{{ supportSection(id) }}</span>
+                  </li>
+                  <li class="no-relation" *ngIf="diff.parentDelta.from === diff.parentDelta.to && !diff.referenceDelta.added.length && !diff.referenceDelta.removed.length && !diff.supportDelta.added.length && !diff.supportDelta.removed.length">
+                    父级、引用与说明书依据均未随版本变化。
+                  </li>
+                </ul>
+
+                <div class="review-opinion">
+                  <label>审查意见
+                    <textarea pTextarea rows="2" [value]="reviewItemOf(diff.featureId).opinion" [placeholder]="state.role === 'viewer' ? '观察者只读' : '记录支持依据或特征关系的核对意见…'" [readonly]="state.role === 'viewer'" (change)="setReviewOpinion(diff.featureId, $event)"></textarea>
+                  </label>
+                  <small class="opinion-meta">
+                    <ng-container *ngIf="reviewItemOf(diff.featureId).updatedAt; else unassigned">
+                      {{ ownerLabel(reviewItemOf(diff.featureId).authorRole) }} {{ reviewItemOf(diff.featureId).authorName }} · {{ reviewItemOf(diff.featureId).updatedAt | date:'MM-dd HH:mm' }}
+                    </ng-container>
+                    <ng-template #unassigned>尚未指派</ng-template>
+                  </small>
+                </div>
+              </article>
+              <div class="empty-state large" *ngIf="!filteredFeatureDiffs.length">当前筛选下没有特征差异。</div>
+            </div>
+          </div>
+
           <div class="version-history" *ngIf="state.versions.length">
             <h3>版本历史</h3>
             <div class="version-row" *ngFor="let version of state.versions">

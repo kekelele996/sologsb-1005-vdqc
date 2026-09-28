@@ -10,7 +10,7 @@ import { BadgeModule } from 'primeng/badge'
 import { DialogModule } from 'primeng/dialog'
 import { TooltipModule } from 'primeng/tooltip'
 import { Subscription } from 'rxjs'
-import type { Annotation, Claim, Feature, Role, ValidationIssue, WorkbenchState } from './models'
+import type { Annotation, Claim, Feature, FeatureChangeKind, FeatureDiff, FeatureReviewItem, ReviewBatch, Role, ValidationIssue, WorkbenchState } from './models'
 import { WorkbenchService } from './workbench.service'
 
 @Component({
@@ -30,6 +30,21 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   versionDialog = false
   versionName = ''
   activeIssue: ValidationIssue | null = null
+  reviewKindFilter: FeatureChangeKind | 'all' = 'all'
+  reviewStatusFilter: 'all' | 'pending' | 'confirmed' | 'rejected' = 'all'
+  reviewAssignMessage = ''
+  readonly reviewKindOptions: Array<{ label: string; value: FeatureChangeKind | 'all' }> = [
+    { label: '全部差异', value: 'all' },
+    { label: '新增特征', value: 'added' },
+    { label: '移除特征', value: 'removed' },
+    { label: '调整特征', value: 'modified' }
+  ]
+  readonly reviewStatusOptions: Array<{ label: string; value: 'all' | 'pending' | 'confirmed' | 'rejected' }> = [
+    { label: '全部状态', value: 'all' },
+    { label: '待确认', value: 'pending' },
+    { label: '已确认', value: 'confirmed' },
+    { label: '已驳回', value: 'rejected' }
+  ]
   roleOptions: Array<{ label: string; value: Role }> = [
     { label: '代理人（可编辑主数据与本人批注）', value: 'author' },
     { label: '审查员（可编辑本人批注）', value: 'examiner' },
@@ -133,6 +148,78 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       const after = b.claims.find(item => item.id === id)?.text || ''
       return { label: `权利要求 ${a.claims.find(item => item.id === id)?.number || b.claims.find(item => item.id === id)?.number || '?'}`, before, after, changed: before !== after }
     })
+  }
+
+  get featureDiffs(): FeatureDiff[] {
+    if (!this.compareA || !this.compareB || this.compareA === this.compareB) return []
+    const a = this.getVersion(this.compareA)
+    const b = this.getVersion(this.compareB)
+    if (!a || !b) return []
+    return this.service.diffFeatures(a.features, b.features, b.claims)
+  }
+
+  get reviewBatch(): ReviewBatch | null {
+    if (!this.compareA || !this.compareB || this.compareA === this.compareB) return null
+    return this.state.reviewBatches.find(batch => batch.baseVersionId === this.compareA && batch.targetVersionId === this.compareB) || null
+  }
+
+  get filteredFeatureDiffs(): FeatureDiff[] {
+    return this.featureDiffs.filter(diff => {
+      if (this.reviewKindFilter !== 'all' && diff.kind !== this.reviewKindFilter) return false
+      if (this.reviewStatusFilter !== 'all' && this.reviewItemOf(diff.featureId).status !== this.reviewStatusFilter) return false
+      return true
+    })
+  }
+
+  get reviewCounts(): { total: number; pending: number; confirmed: number; rejected: number } {
+    const counts = { total: this.featureDiffs.length, pending: 0, confirmed: 0, rejected: 0 }
+    for (const diff of this.featureDiffs) counts[this.reviewItemOf(diff.featureId).status]++
+    return counts
+  }
+
+  reviewItemOf(featureId: string): FeatureReviewItem {
+    const existing = this.reviewBatch?.items.find(item => item.featureId === featureId)
+    return existing || { featureId, status: 'pending', opinion: '', updatedAt: '', authorRole: this.state.role, authorName: '' }
+  }
+
+  reviewKindLabel(kind: FeatureChangeKind): string {
+    return ({ added: '新增', removed: '移除', modified: '调整' })[kind]
+  }
+
+  reviewStatusLabel(status: 'pending' | 'confirmed' | 'rejected'): string {
+    return ({ pending: '待确认', confirmed: '已确认', rejected: '已驳回' })[status]
+  }
+
+  featureNameInVersion(versionId: string, featureId: string | null): string {
+    if (!featureId) return '无'
+    const version = this.getVersion(versionId)
+    return version?.features.find(item => item.id === featureId)?.label || featureId
+  }
+
+  supportSection(id: string): string {
+    return this.state.paragraphs.find(item => item.id === id)?.section || id
+  }
+
+  ensureReviewBatch(): void {
+    if (!this.compareA || !this.compareB || this.compareA === this.compareB) return
+    this.service.ensureReviewBatch(this.compareA, this.compareB)
+  }
+
+  assignReviewBatch(): void {
+    if (!this.compareA || !this.compareB || this.compareA === this.compareB) return
+    const kinds: FeatureChangeKind[] = this.reviewKindFilter === 'all' ? ['added', 'removed', 'modified'] : [this.reviewKindFilter]
+    const touched = this.service.assignReviewBatch(this.compareA, this.compareB, kinds)
+    this.reviewAssignMessage = touched
+      ? `已按当前筛选指派 ${kinds.length === 3 ? '全部差异' : this.reviewKindLabel(kinds[0])}：新增/更新 ${touched} 项，已定稿项保持原样。`
+      : '当前筛选下没有可指派的未定稿差异项。'
+  }
+
+  setReviewStatus(featureId: string, status: 'pending' | 'confirmed' | 'rejected'): void {
+    this.service.setReviewStatus(this.compareA, this.compareB, featureId, status)
+  }
+
+  setReviewOpinion(featureId: string, event: Event): void {
+    this.service.setReviewOpinion(this.compareA, this.compareB, featureId, (event.target as HTMLTextAreaElement).value)
   }
 
   exportFile(type: 'json' | 'csv'): void {

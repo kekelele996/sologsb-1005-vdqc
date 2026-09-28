@@ -1,6 +1,6 @@
 import { Injectable, OnDestroy } from '@angular/core'
 import { BehaviorSubject, map, type Observable } from 'rxjs'
-import type { Annotation, Claim, ClaimVersion, Feature, Paragraph, Position, Role, ValidationIssue, WorkbenchState } from './models'
+import type { Annotation, Claim, ClaimVersion, Feature, FeatureChangeKind, FeatureDiff, FeatureReviewItem, IdDelta, Paragraph, Position, ReviewBatch, ReviewStatus, Role, ValidationIssue, WorkbenchState } from './models'
 
 const STORAGE_KEY = 'patent-claim-mapping-workbench-v1'
 const POSITION_KEY = 'patent-claim-mapping-position-v1'
@@ -32,9 +32,14 @@ const initialAnnotations: Annotation[] = [
 function demoState(): WorkbenchState {
   return {
     claims: initialClaims, paragraphs: initialParagraphs, features: initialFeatures,
-    annotations: initialAnnotations, orphanMappings: [], versions: [],
+    annotations: initialAnnotations, orphanMappings: [], versions: [], reviewBatches: [],
     role: 'author', currentUserRole: 'author', selectedClaimId: 'claim-1', selectedFeatureId: 'feature-b', activeTab: 'mapping'
   }
+}
+export const roleDisplayName = (role: Role): string => ({ author: '代理人 · 陈昊', examiner: '审查员 · 李岚', viewer: '观察者' })[role]
+
+export function reviewBatchId(baseVersionId: string, targetVersionId: string): string {
+  return `review-${baseVersionId}__${targetVersionId}`
 }
 function clone<T>(value: T): T { return structuredClone(value) }
 
@@ -230,6 +235,169 @@ export class WorkbenchService implements OnDestroy {
     })
   }
 
+  /**
+   * 按特征归并两个版本的差异：新增 / 移除 / 调整。
+   * 调整项包含正文、父级、引用、说明书依据四类差异。
+   */
+  compareFeatures(baseVersionId: string, targetVersionId: string): FeatureDiff[] {
+    const base = this.stateSubject.value.versions.find(item => item.id === baseVersionId)
+    const target = this.stateSubject.value.versions.find(item => item.id === targetVersionId)
+    if (!base || !target) return []
+    return this.diffFeatures(base.features, target.features, target.claims)
+  }
+
+  diffFeatures(baseFeatures: Feature[], targetFeatures: Feature[], claims: Claim[] = []): FeatureDiff[] {
+    const rows: FeatureDiff[] = []
+    for (const after of targetFeatures) {
+      const before = baseFeatures.find(item => item.id === after.id)
+      if (!before) {
+        rows.push({
+          kind: 'added', featureId: after.id, claimNumber: this.claimNumberOf(after.claimId, claims),
+          label: after.label, beforeText: '', afterText: after.text,
+          parentDelta: { from: null, to: after.parentId },
+          referenceDelta: { added: [...after.referenceIds], removed: [] },
+          supportDelta: { added: [...after.supportIds], removed: [] }
+        })
+        continue
+      }
+      const referenceDelta = this.idDelta(before.referenceIds, after.referenceIds)
+      const supportDelta = this.idDelta(before.supportIds, after.supportIds)
+      const adjusted = before.text !== after.text || before.label !== after.label ||
+        before.parentId !== after.parentId ||
+        referenceDelta.added.length > 0 || referenceDelta.removed.length > 0 ||
+        supportDelta.added.length > 0 || supportDelta.removed.length > 0
+      if (!adjusted) continue
+      rows.push({
+        kind: 'modified', featureId: after.id, claimNumber: this.claimNumberOf(after.claimId, claims),
+        label: after.label, beforeText: before.text, afterText: after.text,
+        parentDelta: { from: before.parentId, to: after.parentId },
+        referenceDelta, supportDelta
+      })
+    }
+    for (const before of baseFeatures) {
+      if (targetFeatures.some(item => item.id === before.id)) continue
+      rows.push({
+        kind: 'removed', featureId: before.id, claimNumber: this.claimNumberOf(before.claimId, claims),
+        label: before.label, beforeText: before.text, afterText: '',
+        parentDelta: { from: before.parentId, to: null },
+        referenceDelta: { added: [], removed: [...before.referenceIds] },
+        supportDelta: { added: [], removed: [...before.supportIds] }
+      })
+    }
+    const order: Record<FeatureChangeKind, number> = { added: 0, modified: 1, removed: 2 }
+    return rows.sort((a, b) => order[a.kind] - order[b.kind] || (a.claimNumber ?? 0) - (b.claimNumber ?? 0) || a.label.localeCompare(b.label, 'zh-CN'))
+  }
+
+  /** 当前版本对下对应的审查批次（按基准/目标版本归并，懒创建）。 */
+  reviewBatch(baseVersionId: string, targetVersionId: string): ReviewBatch | null {
+    if (!baseVersionId || !targetVersionId || baseVersionId === targetVersionId) return null
+    const id = reviewBatchId(baseVersionId, targetVersionId)
+    return this.stateSubject.value.reviewBatches.find(batch => batch.id === id) || null
+  }
+
+  ensureReviewBatch(baseVersionId: string, targetVersionId: string): ReviewBatch | null {
+    if (!baseVersionId || !targetVersionId || baseVersionId === targetVersionId) return null
+    const id = reviewBatchId(baseVersionId, targetVersionId)
+    let batch = this.stateSubject.value.reviewBatches.find(item => item.id === id)
+    if (batch) return batch
+    this.commit(state => {
+      if (state.reviewBatches.some(item => item.id === id)) return
+      state.reviewBatches.push({ id, baseVersionId, targetVersionId, items: [] })
+    })
+    return this.stateSubject.value.reviewBatches.find(item => item.id === id) || null
+  }
+
+  /** 按当前筛选（差异类型）批量指派给当前角色；未定稿项照常处理，已定稿项保持原样。 */
+  assignReviewBatch(baseVersionId: string, targetVersionId: string, kinds: FeatureChangeKind[]): number {
+    const role = this.stateSubject.value.role
+    if (role === 'viewer') return 0
+    const diffs = this.compareFeatures(baseVersionId, targetVersionId).filter(diff => kinds.includes(diff.kind))
+    if (!diffs.length) return 0
+    const id = reviewBatchId(baseVersionId, targetVersionId)
+    let touched = 0
+    this.commit(state => {
+      let batch = state.reviewBatches.find(item => item.id === id)
+      if (!batch) {
+        batch = { id, baseVersionId, targetVersionId, items: [] }
+        state.reviewBatches.push(batch)
+      }
+      for (const diff of diffs) {
+        const existing = batch.items.find(item => item.featureId === diff.featureId)
+        if (existing && existing.status !== 'pending') continue
+        if (existing) {
+          existing.authorRole = role
+          existing.authorName = roleDisplayName(role)
+          existing.updatedAt = new Date().toISOString()
+        } else {
+          batch.items.push({
+            featureId: diff.featureId, status: 'pending', opinion: '',
+            updatedAt: new Date().toISOString(), authorRole: role, authorName: roleDisplayName(role)
+          })
+        }
+        touched++
+      }
+    })
+    return touched
+  }
+
+  setReviewStatus(baseVersionId: string, targetVersionId: string, featureId: string, status: ReviewStatus): void {
+    if (this.stateSubject.value.role === 'viewer') return
+    this.commit(state => {
+      const batch = this.ensureBatch(state, baseVersionId, targetVersionId)
+      if (!batch) return
+      const item = batch.items.find(entry => entry.featureId === featureId)
+      if (item) {
+        item.status = status
+        item.updatedAt = new Date().toISOString()
+      } else {
+        batch.items.push({
+          featureId, status, opinion: '', updatedAt: new Date().toISOString(),
+          authorRole: state.role, authorName: roleDisplayName(state.role)
+        })
+      }
+    })
+  }
+
+  setReviewOpinion(baseVersionId: string, targetVersionId: string, featureId: string, opinion: string): void {
+    if (this.stateSubject.value.role === 'viewer') return
+    this.commit(state => {
+      const batch = this.ensureBatch(state, baseVersionId, targetVersionId)
+      if (!batch) return
+      const item = batch.items.find(entry => entry.featureId === featureId)
+      if (item) {
+        item.opinion = opinion
+        item.updatedAt = new Date().toISOString()
+      } else {
+        batch.items.push({
+          featureId, status: 'pending', opinion, updatedAt: new Date().toISOString(),
+          authorRole: state.role, authorName: roleDisplayName(state.role)
+        })
+      }
+    })
+  }
+
+  private ensureBatch(state: WorkbenchState, baseVersionId: string, targetVersionId: string): ReviewBatch | null {
+    if (!baseVersionId || !targetVersionId || baseVersionId === targetVersionId) return null
+    const id = reviewBatchId(baseVersionId, targetVersionId)
+    let batch = state.reviewBatches.find(item => item.id === id)
+    if (!batch) {
+      batch = { id, baseVersionId, targetVersionId, items: [] }
+      state.reviewBatches.push(batch)
+    }
+    return batch
+  }
+
+  private claimNumberOf(claimId: string, claims: Claim[]): number | null {
+    return claims.find(claim => claim.id === claimId)?.number ?? null
+  }
+
+  private idDelta(before: string[], after: string[]): IdDelta {
+    return {
+      added: after.filter(id => !before.includes(id)),
+      removed: before.filter(id => !after.includes(id))
+    }
+  }
+
   undo(): void {
     const previous = this.past.pop()
     if (!previous) return
@@ -261,7 +429,40 @@ export class WorkbenchService implements OnDestroy {
     try { return { ...JSON.parse(localStorage.getItem(POSITION_KEY) || '{}'), ...this.stateSubject.value } } catch { return { tab: 'mapping', claimId: this.initialState.selectedClaimId, featureId: this.initialState.selectedFeatureId, scrollY: 0 } }
   }
 
-  exportJson(): string { return JSON.stringify({ ...this.snapshot, validationIssues: this.validate(this.stateSubject.value) }, null, 2) }
+  exportJson(): string {
+    const state = this.stateSubject.value
+    const reviewBatches = state.reviewBatches.map(batch => {
+      const base = state.versions.find(version => version.id === batch.baseVersionId)
+      const target = state.versions.find(version => version.id === batch.targetVersionId)
+      const diffs = base && target ? this.diffFeatures(base.features, target.features, target.claims) : []
+      return {
+        id: batch.id,
+        baseVersion: base ? { id: base.id, name: base.name } : { id: batch.baseVersionId, name: '' },
+        targetVersion: target ? { id: target.id, name: target.name } : { id: batch.targetVersionId, name: '' },
+        items: batch.items.map(item => {
+          const diff = diffs.find(row => row.featureId === item.featureId)
+          return {
+            featureId: item.featureId,
+            change: diff?.kind || 'unresolved',
+            label: diff?.label || item.featureId,
+            claimNumber: diff?.claimNumber ?? null,
+            status: item.status,
+            opinion: item.opinion,
+            authorRole: item.authorRole,
+            authorName: item.authorName,
+            updatedAt: item.updatedAt,
+            parentBefore: diff?.parentDelta.from ?? null,
+            parentAfter: diff?.parentDelta.to ?? null,
+            referencesAdded: diff?.referenceDelta.added ?? [],
+            referencesRemoved: diff?.referenceDelta.removed ?? [],
+            supportsAdded: (diff?.supportDelta.added ?? []).map(id => state.paragraphs.find(paragraph => paragraph.id === id)?.section || id),
+            supportsRemoved: (diff?.supportDelta.removed ?? []).map(id => state.paragraphs.find(paragraph => paragraph.id === id)?.section || id)
+          }
+        })
+      }
+    })
+    return JSON.stringify({ ...this.snapshot, reviewBatches, validationIssues: this.validate(state) }, null, 2)
+  }
 
   exportCsv(): string {
     const state = this.stateSubject.value
