@@ -176,6 +176,87 @@
               </div>
             </article>
           </div>
+
+          <div class="feature-review" *ngIf="state.versions.length >= 2">
+            <div class="feature-review-heading">
+              <div>
+                <h2>特征级审查批次</h2>
+                <p>按技术特征归并两版差异，并列出父级、引用与说明书依据变化；逐项标记确认结论，代理人可按当前筛选批量指派。</p>
+              </div>
+              <div class="review-summary">
+                <span class="status-pending">待确认 {{ reviewBatchSummary.pending }}</span>
+                <span class="status-confirmed">已确认 {{ reviewBatchSummary.confirmed }}</span>
+                <span class="status-rejected">已驳回 {{ reviewBatchSummary.rejected }}</span>
+              </div>
+            </div>
+
+            <div class="review-filters">
+              <div class="filter-group">
+                <span>变化类型</span>
+                <button *ngFor="let option of kindFilters" type="button" class="filter-chip" [class.active]="reviewKindFilter === option.value" (click)="reviewKindFilter = option.value">{{ option.label }}</button>
+              </div>
+              <div class="filter-group">
+                <span>审查状态</span>
+                <button *ngFor="let option of statusFilters" type="button" class="filter-chip" [class.active]="reviewStatusFilter === option.value" (click)="reviewStatusFilter = option.value">{{ option.label }}</button>
+              </div>
+            </div>
+
+            <div class="batch-bar" *ngIf="canBatchAssign; else readOnlyBatchNote">
+              <div class="batch-tip">
+                <i class="pi pi-users"></i>
+                <span>批量指派仅作用于当前筛选中的 <b>{{ pendingInFilterCount }}</b> 个“待确认”特征；已确认 / 已驳回的定稿项保持原样。</span>
+              </div>
+              <textarea pTextarea rows="1" placeholder="可附统一审查意见（不覆盖已填写的意见）" [(ngModel)]="batchComment"></textarea>
+              <div class="batch-actions">
+                <p-button label="批量确认" icon="pi pi-check" severity="success" [outlined]="true" size="small" [disabled]="!pendingInFilterCount" (onClick)="batchAssign('confirmed')" />
+                <p-button label="批量驳回" icon="pi pi-times" severity="danger" [outlined]="true" size="small" [disabled]="!pendingInFilterCount" (onClick)="batchAssign('rejected')" />
+              </div>
+            </div>
+            <ng-template #readOnlyBatchNote>
+              <p class="hint batch-readonly"><i class="pi pi-lock"></i>{{ state.role === 'examiner' ? '审查员可逐项标记与填写意见；批量指派为代理人专属操作。' : '观察者只读，不能标记或填写审查意见。' }}</p>
+            </ng-template>
+
+            <div class="review-entry-list">
+              <article *ngFor="let entry of filteredFeatureComparisons" class="review-entry">
+                <header class="review-entry-head">
+                  <div class="review-entry-title">
+                    <span class="kind-badge"
+                          [class.kind-added]="entry.kind === 'added'"
+                          [class.kind-removed]="entry.kind === 'removed'"
+                          [class.kind-modified]="entry.kind === 'modified'">{{ kindLabels[entry.kind] }}</span>
+                    <strong>{{ entry.label }}</strong>
+                    <small *ngIf="entry.claimNumber !== null">权利要求 {{ entry.claimNumber }}</small>
+                  </div>
+                  <div class="status-pill"
+                       [class.status-pending]="entryStatus(entry.featureId) === 'pending'"
+                       [class.status-confirmed]="entryStatus(entry.featureId) === 'confirmed'"
+                       [class.status-rejected]="entryStatus(entry.featureId) === 'rejected'">{{ statusLabels[entryStatus(entry.featureId)] }}</div>
+                </header>
+
+                <div class="review-diff-grid">
+                  <div class="review-diff-row" *ngFor="let field of entry.fields" [class.changed]="field.changed">
+                    <span class="review-diff-label">{{ field.label }}</span>
+                    <div class="review-diff-before"><small>基准</small><p>{{ field.before || '（无）' }}</p></div>
+                    <div class="review-diff-after"><small>目标</small><p>{{ field.after || '（无）' }}</p></div>
+                  </div>
+                </div>
+
+                <div class="review-entry-foot">
+                  <div class="review-status-actions">
+                    <button type="button" class="review-btn" [class.active-pending]="entryStatus(entry.featureId) === 'pending'" [disabled]="!canReviewFeatures" (click)="setEntryStatus(entry, 'pending')"><i class="pi pi-clock"></i>待确认</button>
+                    <button type="button" class="review-btn" [class.active-confirmed]="entryStatus(entry.featureId) === 'confirmed'" [disabled]="!canReviewFeatures" (click)="setEntryStatus(entry, 'confirmed')"><i class="pi pi-check"></i>已确认</button>
+                    <button type="button" class="review-btn" [class.active-rejected]="entryStatus(entry.featureId) === 'rejected'" [disabled]="!canReviewFeatures" (click)="setEntryStatus(entry, 'rejected')"><i class="pi pi-times"></i>已驳回</button>
+                  </div>
+                  <label class="review-comment-field">
+                    <span>审查意见 <em *ngIf="reviewEntry(entry.featureId) as record">{{ ownerLabel(record.updatedByRole || state.role) }} · {{ record.updatedAt ? (record.updatedAt | date:'MM-dd HH:mm') : '尚未保存' }}</em></span>
+                    <textarea pTextarea rows="2" placeholder="填写该特征差异的核对意见（仅本人角色可写）…" [value]="reviewEntry(entry.featureId)?.comment || ''" [readonly]="!canReviewFeatures" (change)="updateEntryComment(entry, $event)"></textarea>
+                  </label>
+                </div>
+              </article>
+              <div *ngIf="!filteredFeatureComparisons.length" class="empty-state large">当前筛选下没有特征差异条目。</div>
+            </div>
+          </div>
+
           <div class="version-history" *ngIf="state.versions.length">
             <h3>版本历史</h3>
             <div class="version-row" *ngFor="let version of state.versions">

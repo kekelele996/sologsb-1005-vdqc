@@ -10,7 +10,7 @@ import { BadgeModule } from 'primeng/badge'
 import { DialogModule } from 'primeng/dialog'
 import { TooltipModule } from 'primeng/tooltip'
 import { Subscription } from 'rxjs'
-import type { Annotation, Claim, Feature, Role, ValidationIssue, WorkbenchState } from './models'
+import type { Annotation, Claim, Feature, FeatureChangeKind, FeatureComparisonEntry, FeatureReviewEntry, ReviewStatus, Role, ValidationIssue, WorkbenchState } from './models'
 import { WorkbenchService } from './workbench.service'
 
 @Component({
@@ -26,6 +26,9 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
   history = { past: 0, future: 0 }
   compareA = ''
   compareB = ''
+  reviewKindFilter: 'all' | FeatureChangeKind = 'all'
+  reviewStatusFilter: 'all' | ReviewStatus = 'all'
+  batchComment = ''
   annotationDraft = ''
   versionDialog = false
   versionName = ''
@@ -133,6 +136,67 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
       const after = b.claims.find(item => item.id === id)?.text || ''
       return { label: `权利要求 ${a.claims.find(item => item.id === id)?.number || b.claims.find(item => item.id === id)?.number || '?'}`, before, after, changed: before !== after }
     })
+  }
+
+  readonly kindLabels: Record<FeatureChangeKind, string> = { added: '新增', removed: '移除', modified: '调整' }
+  readonly statusLabels: Record<ReviewStatus, string> = { pending: '待确认', confirmed: '已确认', rejected: '已驳回' }
+  readonly kindFilters: Array<{ label: string; value: 'all' | FeatureChangeKind }> = [
+    { label: '全部变化', value: 'all' }, { label: '新增', value: 'added' }, { label: '移除', value: 'removed' }, { label: '调整', value: 'modified' }
+  ]
+  readonly statusFilters: Array<{ label: string; value: 'all' | ReviewStatus }> = [
+    { label: '全部状态', value: 'all' }, { label: '待确认', value: 'pending' }, { label: '已确认', value: 'confirmed' }, { label: '已驳回', value: 'rejected' }
+  ]
+
+  get canReviewFeatures(): boolean { return this.state.role === 'author' || this.state.role === 'examiner' }
+  get canBatchAssign(): boolean { return this.state.role === 'author' }
+
+  get featureComparisons(): FeatureComparisonEntry[] {
+    if (!this.compareA || !this.compareB) return []
+    return this.service.getFeatureComparisons(this.compareA, this.compareB)
+  }
+
+  get filteredFeatureComparisons(): FeatureComparisonEntry[] {
+    return this.featureComparisons.filter(entry =>
+      (this.reviewKindFilter === 'all' || entry.kind === this.reviewKindFilter)
+      && (this.reviewStatusFilter === 'all' || this.entryStatus(entry.featureId) === this.reviewStatusFilter))
+  }
+
+  get pendingInFilterCount(): number {
+    return this.filteredFeatureComparisons.filter(entry => this.entryStatus(entry.featureId) === 'pending').length
+  }
+
+  get reviewBatchSummary(): { pending: number; confirmed: number; rejected: number } {
+    const summary = { pending: 0, confirmed: 0, rejected: 0 }
+    for (const entry of this.featureComparisons) {
+      summary[this.entryStatus(entry.featureId)] += 1
+    }
+    return summary
+  }
+
+  entryStatus(featureId: string): ReviewStatus {
+    return this.service.getReviewEntry(this.compareA, this.compareB, featureId)?.status || 'pending'
+  }
+
+  reviewEntry(featureId: string): FeatureReviewEntry | undefined {
+    return this.service.getReviewEntry(this.compareA, this.compareB, featureId)
+  }
+
+  setEntryStatus(entry: FeatureComparisonEntry, status: ReviewStatus): void {
+    this.service.setFeatureReviewStatus(this.compareA, this.compareB, entry.featureId, status)
+  }
+
+  updateEntryComment(entry: FeatureComparisonEntry, event: Event): void {
+    this.service.setFeatureReviewComment(this.compareA, this.compareB, entry.featureId, (event.target as HTMLTextAreaElement).value)
+  }
+
+  batchAssign(status: ReviewStatus): void {
+    const ids = this.filteredFeatureComparisons.map(entry => entry.featureId)
+    this.service.batchAssignReview(this.compareA, this.compareB, ids, status, this.batchComment)
+    this.batchComment = ''
+  }
+
+  diffFieldValue(entry: FeatureComparisonEntry, key: string, side: 'before' | 'after'): string {
+    return entry.fields.find(field => field.key === key)?.[side] || ''
   }
 
   exportFile(type: 'json' | 'csv'): void {

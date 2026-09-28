@@ -1,6 +1,10 @@
 import { Injectable, OnDestroy } from '@angular/core'
 import { BehaviorSubject, map, type Observable } from 'rxjs'
-import type { Annotation, Claim, ClaimVersion, Feature, Paragraph, Position, Role, ValidationIssue, WorkbenchState } from './models'
+import type {
+  Annotation, Claim, ClaimVersion, Feature, FeatureComparisonEntry, FeatureDiffField,
+  FeatureReviewBatch, FeatureReviewEntry, Paragraph, Position, ReviewStatus, Role,
+  ValidationIssue, WorkbenchState
+} from './models'
 
 const STORAGE_KEY = 'patent-claim-mapping-workbench-v1'
 const POSITION_KEY = 'patent-claim-mapping-position-v1'
@@ -32,7 +36,7 @@ const initialAnnotations: Annotation[] = [
 function demoState(): WorkbenchState {
   return {
     claims: initialClaims, paragraphs: initialParagraphs, features: initialFeatures,
-    annotations: initialAnnotations, orphanMappings: [], versions: [],
+    annotations: initialAnnotations, orphanMappings: [], versions: [], reviewBatches: [],
     role: 'author', currentUserRole: 'author', selectedClaimId: 'claim-1', selectedFeatureId: 'feature-b', activeTab: 'mapping'
   }
 }
@@ -230,6 +234,87 @@ export class WorkbenchService implements OnDestroy {
     })
   }
 
+  /** 按特征 id 归并两版：返回新增 / 移除 / 调整的特征级条目（含父级、引用、说明书依据差异）。 */
+  getFeatureComparisons(baseVersionId: string, targetVersionId: string): FeatureComparisonEntry[] {
+    const base = this.stateSubject.value.versions.find(item => item.id === baseVersionId)
+    const target = this.stateSubject.value.versions.find(item => item.id === targetVersionId)
+    if (!base || !target) return []
+    const entries: FeatureComparisonEntry[] = []
+    const seen = new Set<string>()
+    for (const before of base.features) {
+      seen.add(before.id)
+      const after = target.features.find(item => item.id === before.id)
+      if (after) {
+        const fields = this.buildDiffFields(before, after, base, target)
+        if (fields.some(field => field.changed)) {
+          entries.push({
+            featureId: before.id, kind: 'modified',
+            claimNumber: target.claims.find(claim => claim.id === after.claimId)?.number
+              ?? base.claims.find(claim => claim.id === before.claimId)?.number ?? null,
+            label: after.label || before.label, fields
+          })
+        }
+      } else {
+        entries.push({
+          featureId: before.id, kind: 'removed',
+          claimNumber: base.claims.find(claim => claim.id === before.claimId)?.number ?? null,
+          label: before.label, fields: this.buildSideFields(before, base, true)
+        })
+      }
+    }
+    for (const after of target.features) {
+      if (seen.has(after.id)) continue
+      entries.push({
+        featureId: after.id, kind: 'added',
+        claimNumber: target.claims.find(claim => claim.id === after.claimId)?.number ?? null,
+        label: after.label, fields: this.buildSideFields(after, target, false)
+      })
+    }
+    return entries
+  }
+
+  getReviewBatch(baseVersionId: string, targetVersionId: string): FeatureReviewBatch | undefined {
+    return this.stateSubject.value.reviewBatches
+      .find(batch => batch.baseVersionId === baseVersionId && batch.targetVersionId === targetVersionId)
+  }
+
+  getReviewEntry(baseVersionId: string, targetVersionId: string, featureId: string): FeatureReviewEntry | undefined {
+    return this.getReviewBatch(baseVersionId, targetVersionId)?.entries.find(entry => entry.featureId === featureId)
+  }
+
+  setFeatureReviewStatus(baseVersionId: string, targetVersionId: string, featureId: string, status: ReviewStatus): void {
+    if (this.stateSubject.value.role === 'viewer') return
+    this.commit(state => this.upsertReviewEntry(state, baseVersionId, targetVersionId, featureId, { status }))
+  }
+
+  setFeatureReviewComment(baseVersionId: string, targetVersionId: string, featureId: string, comment: string): void {
+    if (this.stateSubject.value.role === 'viewer') return
+    this.commit(state => this.upsertReviewEntry(state, baseVersionId, targetVersionId, featureId, { comment }))
+  }
+
+  /**
+   * 代理人批量指派：仅作用于当前筛选（条目 id 集合）中状态为“待确认”的特征，
+   * 已确认 / 已驳回的定稿项保持原样；提供意见时仅写入未填写意见的待确认项，不覆盖已有意见。
+   */
+  batchAssignReview(baseVersionId: string, targetVersionId: string, featureIds: string[], status: ReviewStatus, comment: string): number {
+    if (this.stateSubject.value.role !== 'author') return 0
+    const scope = new Set(featureIds)
+    let affected = 0
+    this.commit(state => {
+      for (const featureId of scope) {
+        const existing = this.findReviewEntry(state, baseVersionId, targetVersionId, featureId)
+        if (existing && existing.status !== 'pending') continue
+        const trimmed = comment.trim()
+        this.upsertReviewEntry(state, baseVersionId, targetVersionId, featureId, {
+          status,
+          comment: !existing?.comment && trimmed ? trimmed : undefined
+        })
+        affected += 1
+      }
+    })
+    return affected
+  }
+
   undo(): void {
     const previous = this.past.pop()
     if (!previous) return
@@ -261,7 +346,47 @@ export class WorkbenchService implements OnDestroy {
     try { return { ...JSON.parse(localStorage.getItem(POSITION_KEY) || '{}'), ...this.stateSubject.value } } catch { return { tab: 'mapping', claimId: this.initialState.selectedClaimId, featureId: this.initialState.selectedFeatureId, scrollY: 0 } }
   }
 
-  exportJson(): string { return JSON.stringify({ ...this.snapshot, validationIssues: this.validate(this.stateSubject.value) }, null, 2) }
+  exportJson(): string {
+    return JSON.stringify({
+      ...this.snapshot,
+      validationIssues: this.validate(this.stateSubject.value),
+      featureReviewBatches: this.buildReviewBatchReports()
+    }, null, 2)
+  }
+
+  private buildReviewBatchReports(): unknown[] {
+    const state = this.stateSubject.value
+    return state.reviewBatches.map(batch => {
+      const base = state.versions.find(item => item.id === batch.baseVersionId)
+      const target = state.versions.find(item => item.id === batch.targetVersionId)
+      const comparisons = this.getFeatureComparisons(batch.baseVersionId, batch.targetVersionId)
+      return {
+        baseVersion: base ? { id: base.id, name: base.name, createdAt: base.createdAt } : { id: batch.baseVersionId, name: '（版本已删除）' },
+        targetVersion: target ? { id: target.id, name: target.name, createdAt: target.createdAt } : { id: batch.targetVersionId, name: '（版本已删除）' },
+        summary: {
+          pending: batch.entries.filter(entry => entry.status === 'pending').length,
+          confirmed: batch.entries.filter(entry => entry.status === 'confirmed').length,
+          rejected: batch.entries.filter(entry => entry.status === 'rejected').length
+        },
+        entries: batch.entries.map(entry => {
+          const comparison = comparisons.find(item => item.featureId === entry.featureId)
+          const kindLabel: Record<string, string> = { added: '新增', removed: '移除', modified: '调整' }
+          const statusLabel: Record<ReviewStatus, string> = { pending: '待确认', confirmed: '已确认', rejected: '已驳回' }
+          return {
+            featureId: entry.featureId,
+            changeKind: comparison?.kind || null,
+            changeKindLabel: comparison ? kindLabel[comparison.kind] : '（版本中未找到）',
+            label: comparison?.label || entry.featureId,
+            status: entry.status,
+            statusLabel: statusLabel[entry.status],
+            comment: entry.comment,
+            updatedByRole: entry.updatedByRole,
+            updatedAt: entry.updatedAt
+          }
+        })
+      }
+    })
+  }
 
   exportCsv(): string {
     const state = this.stateSubject.value
@@ -285,6 +410,90 @@ export class WorkbenchService implements OnDestroy {
     }
     state.orphanMappings.forEach(item => issues.push({ id: item.id, severity: 'warning', type: 'orphan-mapping', title: '存在待清理映射', detail: item.reason }))
     return issues
+  }
+
+  private buildDiffFields(before: Feature, after: Feature, base: ClaimVersion, target: ClaimVersion): FeatureDiffField[] {
+    return [
+      { key: 'claim', label: '所属权利要求', before: this.claimNameOf(before.claimId, base), after: this.claimNameOf(after.claimId, target), changed: before.claimId !== after.claimId },
+      { key: 'label', label: '特征名称', before: before.label, after: after.label, changed: before.label !== after.label },
+      { key: 'text', label: '特征正文', before: before.text, after: after.text, changed: before.text !== after.text },
+      { key: 'parent', label: '父级特征', before: this.parentNameOf(before, base), after: this.parentNameOf(after, target), changed: before.parentId !== after.parentId },
+      { key: 'references', label: '引用特征', before: this.referenceNamesOf(before, base), after: this.referenceNamesOf(after, target), changed: !this.sameIdSet(before.referenceIds, after.referenceIds) },
+      { key: 'support', label: '说明书依据', before: this.supportNamesOf(before), after: this.supportNamesOf(after), changed: !this.sameIdSet(before.supportIds, after.supportIds) }
+    ]
+  }
+
+  /** 新增 / 移除条目：保留同一份字段结构，缺失一侧显示为空。 */
+  private buildSideFields(feature: Feature, version: ClaimVersion, removed: boolean): FeatureDiffField[] {
+    const value = {
+      claim: this.claimNameOf(feature.claimId, version),
+      label: feature.label,
+      text: feature.text,
+      parent: this.parentNameOf(feature, version),
+      references: this.referenceNamesOf(feature, version),
+      support: this.supportNamesOf(feature)
+    }
+    const fill = (key: FeatureDiffField['key'], label: string, text: string): FeatureDiffField =>
+      removed ? { key, label, before: text, after: '', changed: true } : { key, label, before: '', after: text, changed: true }
+    return [
+      fill('claim', '所属权利要求', value.claim),
+      fill('label', '特征名称', value.label),
+      fill('text', '特征正文', value.text),
+      fill('parent', '父级特征', value.parent),
+      fill('references', '引用特征', value.references),
+      fill('support', '说明书依据', value.support)
+    ]
+  }
+
+  private claimNameOf(claimId: string, version: ClaimVersion): string {
+    const claim = version.claims.find(item => item.id === claimId)
+    return claim ? `权利要求 ${claim.number} · ${claim.title}` : '（未找到所属项）'
+  }
+
+  private parentNameOf(feature: Feature, version: ClaimVersion): string {
+    if (!feature.parentId) return '无（顶层特征）'
+    return version.features.find(item => item.id === feature.parentId)?.label || `已缺失（${feature.parentId}）`
+  }
+
+  private referenceNamesOf(feature: Feature, version: ClaimVersion): string {
+    if (!feature.referenceIds.length) return '无'
+    return feature.referenceIds.map(id => version.features.find(item => item.id === id)?.label || `已缺失（${id}）`).join('；')
+  }
+
+  private supportNamesOf(feature: Feature): string {
+    if (!feature.supportIds.length) return '未映射说明书段落'
+    const state = this.stateSubject.value
+    return feature.supportIds.map(id => state.paragraphs.find(item => item.id === id)?.section || id).join('；')
+  }
+
+  private sameIdSet(a: string[], b: string[]): boolean {
+    return a.length === b.length && a.every(id => b.includes(id))
+  }
+
+  private findReviewEntry(state: WorkbenchState, baseVersionId: string, targetVersionId: string, featureId: string): FeatureReviewEntry | undefined {
+    return state.reviewBatches
+      .find(batch => batch.baseVersionId === baseVersionId && batch.targetVersionId === targetVersionId)
+      ?.entries.find(entry => entry.featureId === featureId)
+  }
+
+  private upsertReviewEntry(
+    state: WorkbenchState, baseVersionId: string, targetVersionId: string, featureId: string,
+    patch: Partial<Pick<FeatureReviewEntry, 'status' | 'comment'>>
+  ): void {
+    let batch = state.reviewBatches.find(item => item.baseVersionId === baseVersionId && item.targetVersionId === targetVersionId)
+    if (!batch) {
+      batch = { id: `batch-${Date.now()}-${baseVersionId}-${targetVersionId}`, baseVersionId, targetVersionId, entries: [] }
+      state.reviewBatches.push(batch)
+    }
+    let entry = batch.entries.find(item => item.featureId === featureId)
+    if (!entry) {
+      entry = { featureId, status: 'pending', comment: '', updatedByRole: null, updatedAt: '' }
+      batch.entries.push(entry)
+    }
+    if (patch.status !== undefined) entry.status = patch.status
+    if (patch.comment !== undefined) entry.comment = patch.comment
+    entry.updatedByRole = state.role
+    entry.updatedAt = new Date().toISOString()
   }
 
   private hasReferenceCycle(start: Feature, features: Feature[]): boolean {

@@ -49,6 +49,40 @@ export interface ClaimVersion {
   features: Feature[]
 }
 
+export type ReviewStatus = 'pending' | 'confirmed' | 'rejected'
+export type FeatureChangeKind = 'added' | 'removed' | 'modified'
+
+export interface FeatureDiffField {
+  key: 'claim' | 'label' | 'text' | 'parent' | 'references' | 'support'
+  label: string
+  before: string
+  after: string
+  changed: boolean
+}
+
+export interface FeatureComparisonEntry {
+  featureId: string
+  kind: FeatureChangeKind
+  claimNumber: number | null
+  label: string
+  fields: FeatureDiffField[]
+}
+
+export interface FeatureReviewEntry {
+  featureId: string
+  status: ReviewStatus
+  comment: string
+  updatedByRole: Role | null
+  updatedAt: string
+}
+
+export interface FeatureReviewBatch {
+  id: string
+  baseVersionId: string
+  targetVersionId: string
+  entries: FeatureReviewEntry[]
+}
+
 export interface Position {
   tab: string
   claimId: string
@@ -63,6 +97,7 @@ export interface WorkbenchState {
   annotations: Annotation[]
   orphanMappings: OrphanMapping[]
   versions: ClaimVersion[]
+  reviewBatches: FeatureReviewBatch[]
   role: Role
   selectedClaimId: string
   selectedFeatureId: string | null
